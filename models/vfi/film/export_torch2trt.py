@@ -6,33 +6,56 @@ import os
 import json
 
 
-def get_inputs(dynamic_shape=False, half=False):
-    if dynamic_shape:
-        return [
-            torch_tensorrt.Input(
-                min_shape=(1, 3, 352, 352),
-                opt_shape=(1, 3, 480, 832),
-                max_shape=(1, 3, 1152, 1152),
-                dtype=torch.float16 if half else torch.float32,
-            ),  # x0
-            torch_tensorrt.Input(
-                min_shape=(1, 3, 352, 352),
-                opt_shape=(1, 3, 480, 832),
-                max_shape=(1, 3, 1152, 1152),
-                dtype=torch.float16 if half else torch.float32,
-            ),  # x1
-            torch_tensorrt.Input((1, 1), dtype=torch.float16 if half else torch.float32),        # dt
-        ]
+def get_inputs(resolution, half=False):
+    return [
+        torch.randn(1, 3, resolution[0], resolution[1], dtype=torch.float16 if half else torch.float32, device='cuda'),  # x0
+        torch.randn(1, 3, resolution[0], resolution[1], dtype=torch.float16 if half else torch.float32, device='cuda'),  # x1
+        torch.tensor([[0.5]], dtype=torch.float16 if half else torch.float32, device='cuda'),        # dt
+    ]
 
-    else:
-        return [
-            torch_tensorrt.Input((1, 3, 480, 832), dtype=torch.float16 if half else torch.float32),  # x0
-            torch_tensorrt.Input((1, 3, 480, 832), dtype=torch.float16 if half else torch.float32),  # x1
-            torch_tensorrt.Input((1, 1), dtype=torch.float16 if half else torch.float32),        # dt
-        ]
+def tensorrt_compile(model, half=False, output_dir=None, output_name=None, target_resolution=None):
+    try:
+        if target_resolution is not None:
+            for resolution in target_resolution:
+                print(f"Compiling model for resolution {resolution[0]}x{resolution[1]}")
+                inputs = get_inputs(resolution, half=half)
+                # Compile with TensorRT
+                trt_gm = torch_tensorrt.compile(
+                    model,
+                    inputs=inputs,
+                )
+                # Save both formats
+                ep_file = f"{args.output_dir}/{args.output_name}_{resolution[0]}x{resolution[1]}.ep"
+                ts_file = f"{args.output_dir}/{args.output_name}_{resolution[0]}x{resolution[1]}.ts"
+                
+                print(f"Saving ExportedProgram to: {ep_file}")
+                torch_tensorrt.save(trt_gm, ep_file, inputs=inputs)
+                
+                print(f"Saving TorchScript to: {ts_file}")
+                torch_tensorrt.save(trt_gm, ts_file, output_format="torchscript", inputs=inputs)
+        else:
+            print(f"Compiling model for resolution {target_resolution[0]}x{target_resolution[1]}")
+            inputs = get_inputs(target_resolution, half=args.half)
+            trt_gm = torch_tensorrt.compile(model, ir="dynamo", inputs=inputs)
+        
+        print("TensorRT conversion completed successfully!")
+        
+    except Exception as e:
+        print(f"Error during TensorRT compilation: {e}")
+        print("This might be due to unsupported operations or insufficient GPU memory")
+        raise
 
 def torch2trt(args):
-
+    if args.target_resolution is not None:
+        with open(args.target_resolution, 'r') as f:
+            target_resolution = json.load(f)
+        
+        print(f"Number of target resolutions: {len(target_resolution)}")
+        for i, resolution in enumerate(target_resolution):
+            print(f"Target resolution {i}: {resolution[0]}x{resolution[1]}")
+    else:
+        target_resolution = [[256, 256]]
+        print("No target resolution provided, using default resolution 256x256")
     # Load model
     interpolator = Interpolator()
 
@@ -46,84 +69,30 @@ def torch2trt(args):
     interpolator.eval()
     model = interpolator.cuda()
 
-    inputs = get_inputs(dynamic_shape=args.dynamic_shape, half=args.half)
-    model = model.half() if args.half else model.float()
-
-    print("Compiling model with TensorRT...")
-    try:
-        if args.dynamic_shape:
-            # Use torch.export.Dim for proper dynamic shape handling
-            from torch.export import Dim
-            
-            # Define dynamic dimensions with proper constraints
-            dim_h = Dim("height", min=352, max=1152)
-            dim_w = Dim("width", min=352, max=1152)
-            
-            # Create example inputs for tracing
-            dtype = torch.float16 if args.half else torch.float32
-            device = 'cuda'
-            
-            example_inputs = (
-                torch.randn(1, 3, 512, 512, dtype=dtype, device=device),  # x0
-                torch.randn(1, 3, 512, 512, dtype=dtype, device=device),  # x1
-                torch.tensor([[0.5]], dtype=dtype, device=device),        # dt
-            )
-            
-            # Define dynamic shapes for each input
-            dynamic_shapes = {
-                'x0': {2: dim_h, 3: dim_w},  # x0: height and width are dynamic
-                'x1': {},  # x1: height and width are dynamic
-                'batch_dt': {},                   # dt: static shape
-            }
-            
-            # Export with dynamic shapes
-            print("Exporting model with dynamic shapes...")
-            exported_program = torch.export.export(
-                model, 
-                example_inputs, 
-                dynamic_shapes=dynamic_shapes,
-                strict=False
-            )
-
-            # Compile with TensorRT
-            trt_gm = torch_tensorrt.dynamo.compile(
-                exported_program,
-                inputs=inputs,
-            )
-        else:
-            # Use regular compilation for fixed shapes
-            trt_gm = torch_tensorrt.compile(model, ir="dynamo", inputs=inputs)
-        
-        # Save both formats
-        ep_file = f"{args.output_name}.ep"
-        ts_file = f"{args.output_name}.ts"
-        
-        print(f"Saving ExportedProgram to: {ep_file}")
-        torch_tensorrt.save(trt_gm, ep_file, inputs=inputs)
-        
-        print(f"Saving TorchScript to: {ts_file}")
-        torch_tensorrt.save(trt_gm, ts_file, output_format="torchscript", inputs=inputs)
-        
-        print("TensorRT conversion completed successfully!")
-        print(f"Generated files:")
-        print(f"  - {ep_file} (ExportedProgram - for Python runtime)")
-        print(f"  - {ts_file} (TorchScript - for C++ deployment)")
-        
-    except Exception as e:
-        print(f"Error during TensorRT compilation: {e}")
-        print("This might be due to unsupported operations or insufficient GPU memory")
-        raise
+    if args.full_precision:
+        model = model.float()
+        tensorrt_compile(model, half=False, output_dir=args.output_dir, output_name=args.output_name, target_resolution=target_resolution)
+    
+    if args.half:
+        model = model.half()
+        tensorrt_compile(model, half=args.half, output_dir=args.output_dir, output_name=args.output_name, target_resolution=target_resolution)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Convert PyTorch model to TensorRT')
     parser.add_argument("--model_path", required=True, help="Path to the PyTorch model file (.pth)")
+    parser.add_argument("--output_dir", required=True, help="Path to the output directory")
     parser.add_argument("--output_name", required=True, help="Prefix for output TensorRT files")
     parser.add_argument("--half", action="store_true", help="Use half precision (FP16)")
-    parser.add_argument("--dynamic_shape", action="store_true", help="Use dynamic shape")
+    parser.add_argument("--full_precision", action="store_true", help="Use full precision (FP32)")
+    parser.add_argument("--target_resolution", required=True, help="Path to the target resolution file (.json)")
     args = parser.parse_args()
 
     print(f"Loading model from: {args.model_path}")
+    print(f"Output directory: {args.output_dir}")
     print(f"Output prefix: {args.output_name}")
-    print(f"Dynamic shape: {'Yes' if args.dynamic_shape else 'No'}")
-    print(f"Precision: {'FP16' if args.half else 'FP32'}")
+    print(f"Target resolution: {args.target_resolution}")
+    print(f"Half precision: {args.half}")
+    print(f"Full precision: {args.full_precision}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
     torch2trt(args)
