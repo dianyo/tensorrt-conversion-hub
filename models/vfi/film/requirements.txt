@@ -1,0 +1,8 @@
+opencv-python
+torch==2.7.0
+tqdm
+numpy
+onnxruntime-gpu
+torch-tensorrt
+onnx
+onnxconverter-common
