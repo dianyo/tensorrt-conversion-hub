@@ -85,6 +85,10 @@ def tensorrt_compile(model, half=False, output_dir=None, output_name=None, targe
                 trt_gm = torch_tensorrt.compile(
                     model,
                     inputs=inputs,
+                    options={
+                        "debug": True,
+                        "version_compatible": False,
+                    }
                 )
                 # Save both formats - use padded resolution in filename
                 ep_file = f"{output_dir}/{output_name}_{resolution[0]}x{resolution[1]}.ep"
@@ -98,7 +102,10 @@ def tensorrt_compile(model, half=False, output_dir=None, output_name=None, targe
         else:
             print(f"Compiling model for default resolution")
             inputs = get_inputs([256, 256], half=half, align=align)
-            trt_gm = torch_tensorrt.compile(model, ir="dynamo", inputs=inputs)
+            trt_gm = torch_tensorrt.compile(model, ir="dynamo", inputs=inputs, options={
+                "debug": True,
+                "version_compatible": False,
+            })
         
         print("TensorRT conversion completed successfully!")
         

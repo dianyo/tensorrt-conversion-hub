@@ -1,9 +1,9 @@
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import cv2
-import onnxruntime as ort
 from contextlib import contextmanager
 from typing import List, Tuple, Dict
 import os
@@ -15,6 +15,43 @@ import glob
 from common.interpolator import Interpolator
 from common.utils import load_image
 
+
+def _pad_batch(batch, align=64):
+    """Pad the batch to be divisible by align.
+
+    Args:
+        batch: Input tensor [B, C, H, W]
+        align: Alignment value
+
+    Returns:
+        Padded tensor [B, C, H, W] and crop region
+    """
+    # 1 c h w
+    height, width = batch.shape[2:4]
+    height_to_pad = (align - height % align) if height % align != 0 else 0
+    width_to_pad = (align - width % align) if width % align != 0 else 0
+
+    crop_region = [
+        height_to_pad >> 1,
+        width_to_pad >> 1,
+        height + (height_to_pad >> 1),
+        width + (width_to_pad >> 1),
+    ]
+    batch = F.pad(
+        batch,
+        (
+            width_to_pad >> 1,
+            width_to_pad - (width_to_pad >> 1),
+            height_to_pad >> 1,
+            height_to_pad - (height_to_pad >> 1),
+            0,
+            0,
+            0,
+            0,
+        ),
+        mode="constant",
+    )
+    return batch, crop_region
 
 @contextmanager
 def timer():
@@ -347,6 +384,8 @@ def test_tensorrt_inference(img1_path: str, img2_path: str, trt_path: str, warmu
             target_size = (256, 256)
         
         img1, img2, dt = prepare_inputs_fixed_size(img1_path, img2_path, target_size, device, half)
+        img1, _ = _pad_batch(img1, 64)
+        img2, _ = _pad_batch(img2, 64)
         
         # Warmup
         print(f"Warming up ({warmup} iterations)...")
@@ -391,232 +430,6 @@ def test_tensorrt_inference(img1_path: str, img2_path: str, trt_path: str, warmu
     except Exception as e:
         print(f"Error running TensorRT inference: {e}")
         return None, float('inf')
-
-
-def test_onnx_inference(img1_path: str, img2_path: str, onnx_path: str, warmup: int = 5, runs: int = 20, use_gpu: bool = True, half: bool = False):
-    """Test ONNX inference with proper GPU memory management."""
-    precision = "FP16" if half else "FP32"
-    print("\n" + "="*50)
-    print(f"Testing ONNX Inference ({precision})")
-    print("="*50)
-    
-    try:
-        # Setup ONNX Runtime
-        providers = []
-        if use_gpu and torch.cuda.is_available():
-            providers.append('CUDAExecutionProvider')
-        providers.append('CPUExecutionProvider')
-        session_options = ort.SessionOptions()
-        session_options.log_severity_level = 0
-        session = ort.InferenceSession(onnx_path, providers=providers, session_options=session_options)
-        
-        print(f"ONNX Runtime providers: {session.get_providers()}")
-        
-        # Get input names and shapes
-        input_names = [input.name for input in session.get_inputs()]
-        output_names = [output.name for output in session.get_outputs()]
-        input_shapes = [input.shape for input in session.get_inputs()]
-        output_shapes = [output.shape for output in session.get_outputs()]
-        
-        print(f"Input names: {input_names}")
-        print(f"Input shapes: {input_shapes}")
-        print(f"Output names: {output_names}")
-        print(f"Output shapes: {output_shapes}")
-        
-        # Determine expected input size from ONNX model
-        expected_height = input_shapes[0][2] if input_shapes[0][2] != -1 else 256
-        expected_width = input_shapes[0][3] if input_shapes[0][3] != -1 else 256
-        target_size = (expected_width, expected_height)
-        
-        print(f"Using input size: {target_size}")
-        
-        # Check if we can use GPU with IO binding
-        use_gpu_binding = use_gpu and torch.cuda.is_available() and 'CUDAExecutionProvider' in session.get_providers()
-        
-        if use_gpu_binding:
-            print("Using GPU with IO binding for fair comparison")
-            
-            # Prepare inputs as PyTorch tensors on GPU with proper dtype
-            # Use FP16 inputs for FP16 models if keep_io_types=False was used during conversion
-            img1, img2, dt = prepare_inputs_fixed_size(img1_path, img2_path, target_size, 'cuda', half)
-            
-            # Pre-allocate output tensor on GPU with proper dtype 
-            output_shape = output_shapes[0]
-            if output_shape[0] == -1:  # Dynamic batch size
-                output_shape = list(output_shape)
-                output_shape[0] = 1
-            
-            output_dtype = torch.float16 if half else torch.float32
-            output_tensor = torch.empty(output_shape, dtype=output_dtype, device='cuda')
-            
-            # Set up element types using numpy dtypes
-            if half:
-                element_dtype = np.float16
-            else:
-                element_dtype = np.float32
-            
-            # Create IO binding with buffer pointers
-            io_binding = session.io_binding()
-            io_binding.bind_input(
-                name=input_names[0],
-                device_type='cuda',
-                device_id=0,
-                element_type=element_dtype,
-                shape=tuple(img1.shape),
-                buffer_ptr=img1.data_ptr()
-            )
-            io_binding.bind_input(
-                name=input_names[1],
-                device_type='cuda',
-                device_id=0,
-                element_type=element_dtype,
-                shape=tuple(img2.shape),
-                buffer_ptr=img2.data_ptr()
-            )
-            io_binding.bind_input(
-                name=input_names[2],
-                device_type='cuda',
-                device_id=0,
-                element_type=element_dtype,
-                shape=tuple(dt.shape),
-                buffer_ptr=dt.data_ptr()
-            )
-            io_binding.bind_output(
-                name=output_names[0],
-                device_type='cuda',
-                device_id=0,
-                element_type=element_dtype,
-                shape=tuple(output_tensor.shape),
-                buffer_ptr=output_tensor.data_ptr()
-            )
-            
-            # Warmup with IO binding
-            print(f"Warming up ({warmup} iterations)...")
-            for _ in range(warmup):
-                session.run_with_iobinding(io_binding)
-            
-            # Synchronize CUDA before benchmarking
-            torch.cuda.synchronize()
-            
-            # Benchmark with IO binding
-            print(f"Running benchmark ({runs} iterations)...")
-            times = []
-            
-            for i in range(runs):
-                torch.cuda.synchronize()
-                
-                start = time.perf_counter()
-                session.run_with_iobinding(io_binding)
-                torch.cuda.synchronize()
-                
-                end = time.perf_counter()
-                times.append(end - start)
-                
-                if i % 5 == 0:
-                    print(f"  Iteration {i+1}/{runs}: {times[-1]:.4f}s")
-            
-            # Get output shape for return
-            result_shape = output_tensor.shape
-            
-        else:
-            print("Using CPU inference (CUDA not available or not in providers)")
-            
-            # Prepare inputs - ONNX typically expects numpy arrays for CPU
-            img_batch_1, _ = load_image(img1_path)
-            img_batch_2, _ = load_image(img2_path)
-            
-            # Resize to expected size
-            img_batch_1 = cv2.resize(img_batch_1[0], target_size)
-            img_batch_2 = cv2.resize(img_batch_2[0], target_size)
-            
-            # Add batch dimension and transpose to NCHW
-            img_batch_1 = img_batch_1[None, ...].transpose(0, 3, 1, 2).astype(np.float32)
-            img_batch_2 = img_batch_2[None, ...].transpose(0, 3, 1, 2).astype(np.float32)
-            dt_np = np.array([[0.5]], dtype=np.float32)
-            
-            # Create input dictionary for CPU inference
-            input_dict = {
-                input_names[0]: img_batch_1,
-                input_names[1]: img_batch_2,
-                input_names[2]: dt_np
-            }
-            
-            # Warmup with regular inference
-            print(f"Warming up ({warmup} iterations)...")
-            for _ in range(warmup):
-                _ = session.run(output_names, input_dict)
-            
-            # Benchmark with regular inference
-            print(f"Running benchmark ({runs} iterations)...")
-            times = []
-            
-            for i in range(runs):
-                start = time.perf_counter()
-                result = session.run(output_names, input_dict)
-                end = time.perf_counter()
-                times.append(end - start)
-                
-                if i % 5 == 0:
-                    print(f"  Iteration {i+1}/{runs}: {times[-1]:.4f}s")
-            
-            result_shape = result[0].shape
-        
-        avg_time = np.mean(times)
-        std_time = np.std(times)
-        min_time = np.min(times)
-        max_time = np.max(times)
-        
-        print(f"\nResults:")
-        print(f"  Average time: {avg_time:.4f} ± {std_time:.4f} seconds")
-        print(f"  Min time: {min_time:.4f} seconds")
-        print(f"  Max time: {max_time:.4f} seconds")
-        print(f"  FPS: {1/avg_time:.2f}")
-        print(f"  Execution provider: {'GPU (Buffer Binding)' if use_gpu_binding else 'CPU'}")
-        
-        # Clean up the session to free GPU memory and ensure clean state for next test
-        del session
-        
-        return result_shape, avg_time
-        
-    except Exception as e:
-        print(f"Error running ONNX inference: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Clean up on error too
-        try:
-            del session
-        except:
-            pass
-            
-        return None, float('inf')
-
-
-def run_dual_precision_test(test_func, *args, **kwargs):
-    """Run a test function with both FP16 and FP32 precisions."""
-    results = {}
-    
-    # Test FP32 first
-    try:
-        shape, time_fp32 = test_func(*args, **kwargs, half=False)
-        results['FP32'] = time_fp32
-    except Exception as e:
-        print(f"FP32 test failed: {e}")
-        results['FP32'] = float('inf')
-    
-    # Test FP16 if CUDA is available
-    if torch.cuda.is_available():
-        try:
-            shape, time_fp16 = test_func(*args, **kwargs, half=True)
-            results['FP16'] = time_fp16
-        except Exception as e:
-            print(f"FP16 test failed: {e}")
-            results['FP16'] = float('inf')
-    else:
-        print("CUDA not available, skipping FP16 test")
-        results['FP16'] = float('inf')
-    
-    return results
 
 
 def run_test(test_func, *args, **kwargs):
@@ -803,8 +616,8 @@ def main():
     
     parser.add_argument('--img1', type=str, default='photos/one.png', help='Path to first image')
     parser.add_argument('--img2', type=str, default='photos/two.png', help='Path to second image')
-    parser.add_argument('--pytorch_model', type=str, default='film.pt', help='Path to PyTorch model')
-    parser.add_argument('--jit_model', type=str, default='film_net.pt', help='Path to JIT model (base name)')
+    parser.add_argument('--pytorch_model', type=str, default='pt_models/film.pt', help='Path to PyTorch model')
+    parser.add_argument('--jit_model', type=str, default='pt_models/film_net.pt', help='Path to JIT model (base name)')
     parser.add_argument('--trt_models_dir', type=str, default='trt_models', help='Directory containing TensorRT models')
     parser.add_argument('--warmup', type=int, default=5, help='Number of warmup iterations')
     parser.add_argument('--runs', type=int, default=20, help='Number of benchmark iterations')
